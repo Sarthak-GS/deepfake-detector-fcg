@@ -1,0 +1,1628 @@
+================================================================================
+     MULTIMODAL DEEPFAKE DETECTION SYSTEM — COMPLETE IMPLEMENTATION BLUEPRINT
+     Inspired by DFD-FCG (CVPR'25) + Novel Temporal & Frequency Enhancements
+================================================================================
+Document v2.0 | Target: PyTorch 2.2 + Lightning 2.2 | For: Claude Sonnet Codegen
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. PROJECT OVERVIEW & SYSTEM ARCHITECTURE
+ 2. DATASET REQUIREMENTS (Hardware-Constrained)
+ 3. PREPROCESSING PIPELINE
+ 4. MODEL ARCHITECTURE (Detailed)
+ 5. MATHEMATICAL FORMULATION
+ 6. TRAINING PIPELINE
+ 7. EVALUATION PLAN
+ 8. EXPLAINABILITY MODULE
+ 9. UI DESIGN (Gradio)
+10. FULL PROJECT STRUCTURE
+11. LIBRARY SPECIFICATIONS
+12. NOVEL CONTRIBUTIONS & ABLATION PLAN
+
+================================================================================
+1. PROJECT OVERVIEW & SYSTEM ARCHITECTURE
+================================================================================
+
+GOAL: Video-based deepfake detection using three complementary branches:
+  (A) SPATIAL  — FCG-style synoptic attention (from DFD-FCG, proven effective)
+  (B) TEMPORAL — Bi-LSTM on per-frame embeddings (NEW, replaces DFD-FCG's
+                 Conv2D temporal affinity — simpler, captures ordering)
+  (C) FREQUENCY — DCT spectral analysis branch (NEW, catches compression
+                  artifacts invisible to RGB-domain models)
+
+KEY DESIGN DECISIONS:
+  • Backbone: FROZEN OpenCLIP ViT-L/14 (no fine-tuning, ~304M params frozen)
+  • Only the decoder, Bi-LSTM, DCT branch, and classifiers are trained (~15M params)
+  • This allows training on a single GPU (RTX 3060/3070/4060 with 8-12GB VRAM)
+
+SYSTEM FLOW (ASCII):
+
+  Input Video
+      │
+      ▼
+  ┌─────────────────────┐
+  │  PREPROCESSING      │
+  │  Face detect → Crop │
+  │  Align → 150×150    │
+  └────────┬────────────┘
+           │
+           ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  CLIP Transform: Resize(224) → Normalize                    │
+  │  Input: [B, T=8, 3, 224, 224]                               │
+  └────────┬────────────────────────────────────────────────────┘
+           │
+           ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │              FROZEN ViT-L/14 ENCODER                        │
+  │  24 layers, width=1024, heads=16, patch=14                  │
+  │  Patches: (224/14)² = 256 + 1 CLS = 257 tokens             │
+  │  Each layer l outputs: q_l, k_l, v_l, emb_l                │
+  └──┬──────────────┬──────────────┬────────────────────────────┘
+     │              │              │
+     ▼              ▼              ▼
+  ┌────────┐  ┌──────────┐  ┌───────────┐
+  │SPATIAL │  │ TEMPORAL  │  │ FREQUENCY │
+  │(FCG)   │  │ (BiLSTM)  │  │ (DCT)     │
+  │        │  │           │  │           │
+  │Synoptic│  │CLS tokens │  │DCT on     │
+  │Decoder │  │from last  │  │face crops │
+  │24 blks │  │4 layers   │  │per frame  │
+  │        │  │→ BiLSTM   │  │→ Conv+FC  │
+  │y_s     │  │y_t        │  │y_f        │
+  │[B,1024]│  │[B,512]    │  │[B,256]    │
+  └───┬────┘  └─────┬─────┘  └─────┬─────┘
+      │             │              │
+      ▼             ▼              ▼
+  ┌─────────────────────────────────────────┐
+  │  MULTI-BRANCH FUSION                    │
+  │                                         │
+  │  logits_s = Linear(LN(y_s)) → [B,2]   │
+  │  logits_t = Linear(LN(y_t)) → [B,2]   │
+  │  logits_f = Linear(LN(y_f)) → [B,2]   │
+  │  logits_a = Linear(LN(y_s‖y_t‖y_f))   │
+  │           → [B,2]                       │
+  │                                         │
+  │  final = log(mean(softmax(each)) + ε)  │
+  └─────────────────────────────────────────┘
+
+TRAINABLE PARAMETER BUDGET:
+  ┌────────────────────────┬────────────┐
+  │ Component              │ ~Params    │
+  ├────────────────────────┼────────────┤
+  │ Synoptic Decoder       │ ~8M        │
+  │ Bi-LSTM (2 layers)     │ ~4M        │
+  │ DCT Branch             │ ~2M        │
+  │ Classification Heads   │ ~0.5M      │
+  │ Synoptic Embeddings    │ ~0.1M      │
+  ├────────────────────────┼────────────┤
+  │ TOTAL TRAINABLE        │ ~14.6M     │
+  │ TOTAL FROZEN (ViT-L)   │ ~304M      │
+  └────────────────────────┴────────────┘
+
+
+================================================================================
+2. DATASET REQUIREMENTS (Hardware-Constrained)
+================================================================================
+
+CONSTRAINT: Single GPU (8-12GB VRAM), limited storage (~100-200GB)
+
+────────────────────────────────────────
+2.1 DATASETS TO USE
+────────────────────────────────────────
+
+┌──────────────────┬──────────┬───────────┬──────────────────────────────┐
+│ Dataset          │ Videos   │ Role      │ Notes                        │
+├──────────────────┼──────────┼───────────┼──────────────────────────────┤
+│ FaceForensics++  │ ~5,000   │ TRAIN+VAL │ c23 compression ONLY         │
+│ (FF++ c23)       │          │           │ Types: REAL,DF,F2F,FS,NT     │
+│                  │          │           │ Train: 720 pairs             │
+│                  │          │           │ Val: 140 pairs               │
+│                  │          │           │ Test: 140 pairs              │
+├──────────────────┼──────────┼───────────┼──────────────────────────────┤
+│ Celeb-DF v2      │ ~6,229   │ TEST ONLY │ Cross-dataset generalization │
+│ (CDF)            │          │           │ 590 real + 5639 fake         │
+└──────────────────┴──────────┴───────────┴──────────────────────────────┘
+
+WHY THIS IS ENOUGH:
+  - DFD-FCG paper trains on FF++ c23 ONLY and achieves SOTA on CDF/DFDC
+  - The frozen CLIP backbone provides strong pretrained features
+  - Cross-dataset test on CDF proves generalization
+  - Total storage: FF++ c23 ~40GB + CDF ~15GB = ~55GB
+
+OPTIONAL (if resources allow):
+  - Add DFDC subset (1000 test videos) for additional cross-dataset eval
+  - Add DeeperForensics-1.0 for another test benchmark
+
+────────────────────────────────────────
+2.2 TRAIN/VAL/TEST SPLIT
+────────────────────────────────────────
+
+FF++ provides official splits in JSON:
+  train.json: 720 identity pairs → ~720 real + ~2880 fake videos
+  val.json:   140 identity pairs → ~140 real + ~560 fake videos  
+  test.json:  140 identity pairs → ~140 real + ~560 fake videos
+
+Split usage:
+  TRAIN:  FF++ train.json (REAL + DF + FS + F2F + NT, c23)
+  VAL:    FF++ val.json (c23) — used for early stopping & checkpointing
+  TEST:   FF++ test.json (c23) — in-domain performance
+          CDF full test set — cross-dataset generalization
+
+────────────────────────────────────────
+2.3 DATASET ON-DISK FORMAT
+────────────────────────────────────────
+
+datasets/
+├── ffpp/
+│   ├── real/c23/videos/*.avi          # raw compressed real videos
+│   ├── DF/c23/videos/*.avi            # DeepFakes forgeries
+│   ├── FS/c23/videos/*.avi            # FaceSwap forgeries
+│   ├── F2F/c23/videos/*.avi           # Face2Face forgeries
+│   ├── NT/c23/videos/*.avi            # NeuralTextures forgeries
+│   ├── real/c23/cropped/videos/*.avi  # preprocessed (face-cropped)
+│   ├── DF/c23/cropped/videos/*.avi
+│   ├── FS/c23/cropped/videos/*.avi
+│   ├── F2F/c23/cropped/videos/*.avi
+│   ├── NT/c23/cropped/videos/*.avi
+│   ├── frame_data/                    # pickled landmarks & bboxes
+│   │   └── <type>/c23/<video_name>.pickle
+│   └── csv_files/
+│       ├── train.json                 # [[id1,id2], ...] 720 pairs
+│       ├── val.json                   # 140 pairs
+│       └── test.json                  # 140 pairs
+│
+└── cdf/
+    ├── REAL/videos/*.avi
+    ├── FAKE/videos/*.avi
+    ├── REAL/cropped/videos/*.avi       # preprocessed
+    ├── FAKE/cropped/videos/*.avi
+    └── csv_files/
+        ├── test_real.csv
+        └── test_fake.csv
+
+
+================================================================================
+3. PREPROCESSING PIPELINE
+================================================================================
+
+────────────────────────────────────────
+3.1 STEP 1: FACIAL LANDMARK & BBOX EXTRACTION
+────────────────────────────────────────
+
+Tool: face-alignment library (pip install face-alignment)
+Model: 2D-FAN (Face Alignment Network)
+Detection backend: SFD (S3FD face detector, built into face-alignment)
+
+Command:
+  python -m src.preprocess.fetch_landmark_bbox \
+    --root-dir="datasets/ffpp/" \
+    --video-dir="videos" \
+    --fdata-dir="frame_data" \
+    --glob-exp="*/*" \
+    --batch=1 \
+    --max-res=800
+
+Per-frame output (saved as pickle per video):
+  [
+    {
+      "landmarks": [np.ndarray shape (68,2)],   # 68 facial keypoints
+      "bboxes": [np.ndarray shape (2,2)]         # [[x1,y1],[x2,y2]]
+    },
+    ... # one dict per frame
+  ]
+
+Key parameters:
+  - max-res=800: limits frame resolution to 800px longest side
+  - batch=1: processes one frame at a time (GPU memory safe)
+  - Face selection: largest face by bounding box diagonal
+
+────────────────────────────────────────
+3.2 STEP 2: FACE CROPPING & ALIGNMENT
+────────────────────────────────────────
+
+Tool: Custom script using OpenCV + mean face template
+Mean face: misc/20words_mean_face.npy (from LRW dataset, 68 landmarks)
+
+Command:
+  python -m src.preprocess.crop_main_face \
+    --root-dir="datasets/ffpp/" \
+    --video-dir="videos" \
+    --fdata-dir="frame_data" \
+    --crop-dir="cropped" \
+    --glob-exp="*/*" \
+    --crop-width=150 \
+    --crop-height=150 \
+    --mean-face="./misc/20words_mean_face.npy"
+
+Algorithm per frame:
+  1. Load landmarks for largest detected face
+  2. Select 3 alignment points from 68 landmarks:
+     - Left eye center (avg of points 36-41)
+     - Right eye center (avg of points 42-47)
+     - Nose tip (point 30)
+  3. Compute affine transform: src_landmarks → mean_face_landmarks
+  4. Apply cv2.warpAffine to original frame
+  5. Crop center 150×150 region
+  6. Write as .avi (XVID codec, original FPS preserved)
+
+Output: <root>/cropped/videos/<video_name>.avi
+
+────────────────────────────────────────
+3.3 STEP 3: RUNTIME TRANSFORMS
+────────────────────────────────────────
+
+At training/inference time, the CLIP transform is applied:
+
+  def _transform(n_px=224):
+      return Compose([
+          Resize(n_px, interpolation=BICUBIC, antialias=True),
+          CenterCrop(n_px),
+          ConvertToFloat,        # divide by 255 if uint8
+          Normalize(
+              mean=(0.48145466, 0.4578275, 0.40821073),
+              std=(0.26862954, 0.26130258, 0.27577711)
+          ),
+      ])
+
+Input: [T, 3, 150, 150] uint8  →  Output: [T, 3, 224, 224] float32
+
+────────────────────────────────────────
+3.4 DATA AUGMENTATION (Training Only)
+────────────────────────────────────────
+
+Using albumentations with ReplayCompose for temporal consistency.
+
+VIDEO-LEVEL (same transform for all frames in a clip):
+  alb.ReplayCompose([
+      alb.HorizontalFlip(),
+      alb.Resize(224, 224, cv2.INTER_CUBIC),
+      alb.RGBShift((-20,20), (-20,20), (-20,20), p=0.3),
+      alb.HueSaturationValue(
+          hue_shift_limit=(-0.3,0.3),
+          sat_shift_limit=(-0.3,0.3),
+          val_shift_limit=(-0.3,0.3), p=0.3
+      ),
+      alb.RandomBrightnessContrast(
+          brightness_limit=(-0.1,0.1),
+          contrast_limit=(-0.1,0.1), p=0.3
+      ),
+      alb.RandomResizedCrop(224, 224, scale=(0.6,1.0), ratio=(1,1), p=1.0),
+      alb.OneOf([
+          alb.ImageCompression(quality_lower=40, quality_upper=100),
+          alb.Compose([
+              alb.RandomScale((-0.4,-0.2), always_apply=True),
+              alb.Resize(224, 224, cv2.INTER_CUBIC, always_apply=True)
+          ]),
+          alb.Blur([3,5])
+      ], p=0.5),
+  ], p=1.0)
+
+FRAME-LEVEL (independent per frame, very subtle):
+  alb.ReplayCompose([
+      alb.Resize(224, 224, cv2.INTER_CUBIC),
+      alb.RGBShift((-5,5),(-5,5),(-5,5), p=0.1),
+      alb.HueSaturationValue((-0.05,0.05),(-0.05,0.05),(-0.05,0.05), p=0.1),
+      alb.RandomBrightnessContrast((-0.05,0.05),(-0.05,0.05), p=0.1),
+      alb.ImageCompression(quality_lower=80, quality_upper=100, p=0.1),
+  ], p=1.0)
+
+────────────────────────────────────────
+3.5 FRAME SAMPLING
+────────────────────────────────────────
+
+  num_frames = 8          # reduced from 10 to save memory
+  clip_duration = 3       # seconds
+  max_clips = 2           # clips per video (reduced from 3)
+
+  Training:
+    - Random speed factor ∈ [0.5, 1.0] (temporal augmentation)
+    - Random shift within remaining duration
+    - Uniform sampling of 8 frames within augmented clip
+
+  Inference:
+    - Fixed speed = 1.0, no shift
+    - Sliding window: stride = clip_duration, batch all clips
+
+────────────────────────────────────────
+3.6 CLASS BALANCE
+────────────────────────────────────────
+
+Strategy: FORCE_PAIR sampling (from DFD-FCG)
+  - Each batch item = (real_clip, fake_clip) from same identity
+  - Guarantees exact 50/50 real/fake balance
+  - If pairing fails, skip that item (no random fallback)
+  - Combined with Focal Loss (γ=4) for hard example mining
+
+
+================================================================================
+4. MODEL ARCHITECTURE (DETAILED)
+================================================================================
+
+────────────────────────────────────────
+4.1 BACKBONE: FROZEN OpenCLIP ViT-L/14
+────────────────────────────────────────
+
+Source: open_clip library, pretrained on LAION-2B
+Architecture string: "ViT-L/14|laion2b_s32b_b82k"
+
+Loading procedure:
+  1. Load via open_clip.create_model_and_transforms("ViT-L-14", "laion2b_s32b_b82k")
+  2. Extract state_dict
+  3. Re-build using custom VisionTransformer (from src/clip/model_syno.py) that
+     exposes per-layer q,k,v,emb attributes
+  4. Freeze ALL encoder parameters: model.requires_grad_(False)
+
+ViT-L/14 Specifications:
+  ┌──────────────────────┬────────────┐
+  │ Parameter            │ Value      │
+  ├──────────────────────┼────────────┤
+  │ Input resolution     │ 224×224    │
+  │ Patch size           │ 14×14      │
+  │ Grid size            │ 16×16      │
+  │ Num patches          │ 256        │
+  │ Sequence length      │ 257 (+CLS) │
+  │ Embedding width      │ 1024       │
+  │ Num heads            │ 16         │
+  │ Head dimension       │ 64         │
+  │ Num layers           │ 24         │
+  │ MLP ratio            │ 4          │
+  │ MLP hidden dim       │ 4096       │
+  │ Output dim (proj)    │ 768        │
+  │ Total parameters     │ ~304M      │
+  └──────────────────────┴────────────┘
+
+Modified VisionTransformer internals (from model_syno.py):
+  - Each VResidualAttentionBlock uses MultiheadAttentionAttrExtract instead
+    of nn.MultiheadAttention, which returns q, k, v, out as a dict
+  - The forward pass exposes per-layer attributes for the decoder
+
+Per-layer output tensor shapes (for input [B, T=8, 3, 224, 224]):
+
+  ┌──────────┬──────────────────────────────┐
+  │ Attr     │ Shape                        │
+  ├──────────┼──────────────────────────────┤
+  │ q        │ [B, T, 257, 16, 64]          │
+  │ k        │ [B, T, 257, 16, 64]          │
+  │ v        │ [B, T, 257, 16, 64]          │
+  │ out      │ [B, T, 257, 1024]            │
+  │ emb      │ [B, T, 257, 1024]            │
+  └──────────┴──────────────────────────────┘
+
+  Note: Only image embeddings are used (NOT text encoder).
+  The text projection (model.proj) is set to None.
+  So feat_dim = width = 1024 (not the projected 768).
+
+────────────────────────────────────────
+4.2 BRANCH A: SPATIAL — FCG Synoptic Decoder
+────────────────────────────────────────
+(Retained from DFD-FCG — this is the proven spatial component)
+
+PURPOSE: Detect spatial forgery artifacts by attending to specific facial
+         regions (lips, skin, eyes, nose) using learnable synoptic queries.
+
+ARCHITECTURE: 24 SynoBlocks (one per ViT encoder layer), stacked.
+
+Each SynoBlock (spatial mode):
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ SynoBlock_spatial(layer_l)                                         │
+  │                                                                     │
+  │ Inputs:                                                             │
+  │   k_l: [B, T, 257, 16, 64]  — keys from encoder layer l           │
+  │   v_l: [B, T, 257, 1024]    — embeddings from encoder layer l     │
+  │   (we use k_l[:,:,1:] and emb_l[:,:,1:] — drop CLS token)         │
+  │                                                                     │
+  │ Parameters:                                                         │
+  │   synoptic_embedding: [4, 1024]  — one per face part               │
+  │   (initialized from face_features pickle, then learned)             │
+  │                                                                     │
+  │ Forward:                                                            │
+  │   1. s_q = synoptic_embedding.unsqueeze(0).repeat(B,1,1)           │
+  │      → [B, 4, 1024]                                                │
+  │                                                                     │
+  │   2. _k = k_l[:,:,1:].flatten(-2) → [B, T, 256, 1024]             │
+  │      _v = emb_l[:,:,1:]           → [B, T, 256, 1024]             │
+  │                                                                     │
+  │   3. Cosine-similarity attention:                                   │
+  │      s_aff = (s_q_norm @ _k_norm.T) * 100                         │
+  │      s_aff = softmax(s_aff, dim=-1)                                │
+  │      → [B, T, 4, 256]                                              │
+  │                                                                     │
+  │   4. Attend:                                                        │
+  │      s_mix = s_aff @ _v → [B, T, 4, 1024]                         │
+  │                                                                     │
+  │   5. Pool: y_s_l = mean(s_mix, dim=(1,2)) → [B, 1024]             │
+  │                                                                     │
+  │ Output: y_s_l ∈ ℝ^{B×1024}                                        │
+  └─────────────────────────────────────────────────────────────────────┘
+
+Aggregation across layers:
+  y_s = Σ_{l=1}^{24} y_s_l     (element-wise sum)
+  Final: y_s ∈ ℝ^{B × 1024}
+
+FCG (Facial Component Guidance) Loss:
+  - Pre-extracted face part features stored in:
+    misc/L14_real_semantic_patches_v4_2000.pickle
+  - Contains mean k-vectors for {lips, skin, eyes, nose} per layer
+  - At training time, a cross-entropy loss aligns synoptic embeddings
+    to their target face parts (see Section 5 for math)
+
+────────────────────────────────────────
+4.3 BRANCH B: TEMPORAL — Bi-LSTM (NEW)
+────────────────────────────────────────
+(Replaces DFD-FCG's Conv2D temporal affinity — our novel contribution)
+
+PURPOSE: Capture temporal inconsistencies across frames that indicate
+         deepfakes (e.g., flickering boundaries, unnatural motion,
+         identity drift). LSTMs naturally model sequential dependencies
+         and can detect when frame transitions are "unsmooth."
+
+WHY Bi-LSTM INSTEAD OF DFD-FCG's TEMPORAL BRANCH:
+  1. DFD-FCG computes T×T affinity matrices with Conv2D — O(T²) memory
+  2. Bi-LSTM is O(T) and captures long-range temporal patterns
+  3. Bidirectional processing catches both forward and backward anomalies
+  4. Simpler to implement and debug
+  5. Well-established for sequence modeling tasks
+
+ARCHITECTURE:
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ TemporalBiLSTM                                                      │
+  │                                                                     │
+  │ Input: Per-frame CLS embeddings from LAST 4 ViT layers             │
+  │                                                                     │
+  │ Step 1: Extract CLS tokens from layers 21-24                       │
+  │   cls_l = emb_l[:, :, 0, :]  → [B, T, 1024] for each layer       │
+  │   cls_cat = mean(cls_21..cls_24) → [B, T, 1024]                   │
+  │                                                                     │
+  │ Step 2: Temporal difference features                                │
+  │   diff = cls_cat[:, 1:, :] - cls_cat[:, :-1, :]  → [B, T-1, 1024]│
+  │   diff_padded = pad(diff, (0,0,0,1)) → [B, T, 1024]              │
+  │                                                                     │
+  │ Step 3: Concatenate original + difference                           │
+  │   lstm_input = cat([cls_cat, diff_padded], dim=-1) → [B, T, 2048] │
+  │                                                                     │
+  │ Step 4: Project down                                                │
+  │   input_proj = Linear(2048, 512) + GELU                            │
+  │   → [B, T, 512]                                                    │
+  │                                                                     │
+  │ Step 5: Bi-LSTM                                                     │
+  │   lstm = nn.LSTM(                                                   │
+  │       input_size=512,                                               │
+  │       hidden_size=256,                                              │
+  │       num_layers=2,                                                 │
+  │       batch_first=True,                                             │
+  │       bidirectional=True,                                           │
+  │       dropout=0.3                                                   │
+  │   )                                                                 │
+  │   output → [B, T, 512]  (256*2 for bidirectional)                  │
+  │                                                                     │
+  │ Step 6: Attention pooling over time                                 │
+  │   attn_weights = Linear(512, 1)                                    │
+  │   attn_weights = softmax(attn_weights, dim=1) → [B, T, 1]         │
+  │   y_t = sum(output * attn_weights, dim=1) → [B, 512]              │
+  │                                                                     │
+  │ Output: y_t ∈ ℝ^{B × 512}                                         │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Total params: ~4.2M
+    input_proj: 2048×512 + 512 = ~1.05M
+    LSTM: 4 * (512+256) * 256 * 2_layers * 2_dirs ≈ ~3.1M
+    attn: 512×1 = ~0.5K
+
+────────────────────────────────────────
+4.4 BRANCH C: FREQUENCY — DCT Spectral Branch (NEW)
+────────────────────────────────────────
+
+PURPOSE: Deepfake generation and compression introduce artifacts in the
+         frequency domain that are invisible in RGB space. DCT analysis
+         can detect unnatural spectral patterns (e.g., missing high-freq
+         details, checkerboard artifacts from upsampling).
+
+ARCHITECTURE:
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ FrequencyDCTBranch                                                  │
+  │                                                                     │
+  │ Input: Raw face crops BEFORE CLIP normalization                     │
+  │   x_raw: [B, T, 3, 224, 224]                                      │
+  │                                                                     │
+  │ Step 1: Convert to grayscale                                        │
+  │   gray = 0.299*R + 0.587*G + 0.114*B → [B, T, 1, 224, 224]       │
+  │                                                                     │
+  │ Step 2: Split into 8×8 patches (like JPEG)                         │
+  │   patches = unfold(gray, kernel=8, stride=8) → [B, T, 784, 64]    │
+  │   (224/8 = 28, so 28×28 = 784 patches, each 8×8 = 64 values)     │
+  │                                                                     │
+  │ Step 3: Apply DCT-II to each 8×8 patch                             │
+  │   Use torch.fft or precomputed DCT matrix:                         │
+  │   D = dct_matrix(8) ∈ ℝ^{8×8}                                     │
+  │   dct_patches = D @ patches.view(8,8) @ D.T                       │
+  │   → [B, T, 784, 8, 8]                                             │
+  │                                                                     │
+  │ Step 4: Extract spectral statistics per frame                       │
+  │   For each frame, compute over all 784 patches:                     │
+  │     - mean of DCT coefficients: [8, 8] = 64 features              │
+  │     - std of DCT coefficients: [8, 8] = 64 features               │
+  │     - log-energy per frequency band: 64 features                   │
+  │   Total: 192 features per frame                                     │
+  │   → [B, T, 192]                                                    │
+  │                                                                     │
+  │ Step 5: Temporal aggregation (simple mean + std across T)           │
+  │   feat_mean = mean(features, dim=1) → [B, 192]                    │
+  │   feat_std = std(features, dim=1) → [B, 192]                      │
+  │   freq_feat = cat([feat_mean, feat_std]) → [B, 384]               │
+  │                                                                     │
+  │ Step 6: MLP projection                                              │
+  │   freq_proj = Sequential(                                           │
+  │       Linear(384, 512), GELU, Dropout(0.3),                        │
+  │       Linear(512, 256), GELU, Dropout(0.2)                         │
+  │   )                                                                 │
+  │   y_f = freq_proj(freq_feat) → [B, 256]                           │
+  │                                                                     │
+  │ Output: y_f ∈ ℝ^{B × 256}                                         │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  DCT-II matrix (precomputed, not learned):
+    D[k,n] = cos(π(2n+1)k / 2N) * normalization_factor
+    where N=8, k,n ∈ {0,...,7}
+
+  Total trainable params: ~0.4M
+    Linear(384,512): 197K
+    Linear(512,256): 131K
+    + biases: ~1K
+
+────────────────────────────────────────
+4.5 FUSION & CLASSIFICATION
+────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ MultibranchClassifier                                               │
+  │                                                                     │
+  │ Inputs:                                                             │
+  │   y_s ∈ ℝ^{B×1024}  (spatial)                                     │
+  │   y_t ∈ ℝ^{B×512}   (temporal)                                    │
+  │   y_f ∈ ℝ^{B×256}   (frequency)                                   │
+  │                                                                     │
+  │ Branch heads (each: LayerNorm + Linear → 2):                       │
+  │   logits_s = Linear(LayerNorm(y_s), 2)  — spatial head             │
+  │   logits_t = Linear(LayerNorm(y_t), 2)  — temporal head            │
+  │   logits_f = Linear(LayerNorm(y_f), 2)  — frequency head           │
+  │                                                                     │
+  │ Aggregate head:                                                     │
+  │   y_cat = cat([y_s, y_t, y_f], dim=-1) → [B, 1792]               │
+  │   logits_a = Linear(LayerNorm(y_cat), 2)  — aggregate head        │
+  │                                                                     │
+  │ Final prediction (log-average of softmax):                          │
+  │   p_s = softmax(logits_s)                                          │
+  │   p_t = softmax(logits_t)                                          │
+  │   p_f = softmax(logits_f)                                          │
+  │   p_a = softmax(logits_a)                                          │
+  │   logits = log((p_s + p_t + p_f + p_a) / 4 + 1e-4)               │
+  │                                                                     │
+  │ Output: logits ∈ ℝ^{B × 2}   [P(real), P(fake)]                   │
+  └─────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+5. MATHEMATICAL FORMULATION
+================================================================================
+
+────────────────────────────────────────
+5.1 NOTATION
+────────────────────────────────────────
+
+  B = batch size
+  T = number of frames per clip (8)
+  L = number of ViT layers (24)
+  P = number of patches (256)
+  D = embedding dimension (1024)
+  H = number of attention heads (16)
+  d = head dimension (64)
+  K = number of face parts/synoptic queries (4)
+
+────────────────────────────────────────
+5.2 FEATURE EXTRACTION
+────────────────────────────────────────
+
+ViT Encoder (frozen):
+  Given input x ∈ ℝ^{B×T×3×224×224}:
+
+  Step 1: Patch embedding
+    x_patch = Conv2D(x, kernel=14, stride=14) → ℝ^{B×T×256×D}
+
+  Step 2: Prepend CLS + positional encoding
+    z_0 = [CLS; x_patch] + pos_embed ∈ ℝ^{B×T×257×D}
+    z_0 = LayerNorm(z_0)
+
+  Step 3: Transformer layers (l = 1..L)
+    For each layer l:
+      q_l, k_l, v_l = Linear(LayerNorm(z_{l-1})) split into 3
+      q_l, k_l, v_l ∈ ℝ^{B×T×257×H×d}
+      
+      A_l = softmax(q_l · k_l^T / √d)  ∈ ℝ^{B×T×257×257×H}
+      attn_out_l = A_l · v_l ∈ ℝ^{B×T×257×D}
+      
+      z_l = z_{l-1} + out_proj(attn_out_l)
+      z_l = z_l + MLP(LayerNorm(z_l))
+
+────────────────────────────────────────
+5.3 SPATIAL BRANCH (FCG)
+────────────────────────────────────────
+
+  For layer l:
+    s_q ∈ ℝ^{K×D}     (synoptic embeddings, K=4 face parts)
+    _k_l = k_l[:,:,1:] ∈ ℝ^{B×T×P×D}   (patches only, flatten heads)
+    _v_l = z_l[:,:,1:] ∈ ℝ^{B×T×P×D}   (patch embeddings)
+
+  Cosine-similarity attention:
+    sim(s_q, _k_l) = (s_q / ‖s_q‖) · (_k_l / ‖_k_l‖)^T
+    α_l = softmax(100 · sim(s_q, _k_l), dim=-1) ∈ ℝ^{B×T×K×P}
+
+  Attended features:
+    m_l = α_l · _v_l ∈ ℝ^{B×T×K×D}
+    y_s_l = mean(m_l, dim=(T,K)) ∈ ℝ^{B×D}
+
+  Final spatial:
+    y_s = Σ_{l=1}^{L} y_s_l ∈ ℝ^{B×D}
+
+────────────────────────────────────────
+5.4 TEMPORAL BRANCH (Bi-LSTM — NEW)
+────────────────────────────────────────
+
+  Step 1: CLS extraction from last 4 layers
+    c_l = z_l[:, :, 0, :] ∈ ℝ^{B×T×D}   for l ∈ {21,22,23,24}
+    c = mean(c_21, c_22, c_23, c_24) ∈ ℝ^{B×T×D}
+
+  Step 2: Temporal difference
+    δ_t = c[:, t, :] - c[:, t-1, :]  for t = 1..T-1
+    δ = pad(δ, dim=1) ∈ ℝ^{B×T×D}     (zero-pad at t=0)
+
+  Step 3: Feature composition
+    h_in = [c ‖ δ] ∈ ℝ^{B×T×2D}
+    h_proj = GELU(Linear(h_in)) ∈ ℝ^{B×T×512}
+
+  Step 4: Bi-LSTM
+    h_lstm, _ = BiLSTM(h_proj) ∈ ℝ^{B×T×512}
+
+  Step 5: Attention pooling
+    w_t = softmax(Linear(h_lstm), dim=1) ∈ ℝ^{B×T×1}
+    y_t = Σ_t w_t · h_lstm ∈ ℝ^{B×512}
+
+  WHY temporal differences:
+    Frame-to-frame changes are small in real videos but can exhibit
+    sudden jumps in deepfakes at manipulation boundaries.
+    The Bi-LSTM then models whether these differences follow a
+    natural temporal pattern or show artifacts.
+
+────────────────────────────────────────
+5.5 FREQUENCY BRANCH (DCT — NEW)
+────────────────────────────────────────
+
+  Step 1: Grayscale conversion
+    g = 0.299·R + 0.587·G + 0.114·B ∈ ℝ^{B×T×1×224×224}
+
+  Step 2: 8×8 block DCT
+    Split into 28×28 = 784 non-overlapping 8×8 patches
+    For each patch p_ij ∈ ℝ^{8×8}:
+      F_ij = D · p_ij · D^T ∈ ℝ^{8×8}
+    where D[k,n] = α_k · cos(π(2n+1)k / 16),  α_0=1/√8, α_k=√(2/8)
+
+  Step 3: Spectral statistics per frame
+    μ_t = (1/784) Σ_{ij} F_ij ∈ ℝ^{64}         (mean spectrum)
+    σ_t = std_{ij}(F_ij) ∈ ℝ^{64}               (variance)
+    E_t = log(1 + (1/784) Σ_{ij} F_ij²) ∈ ℝ^{64}  (log energy)
+    f_t = [μ_t ‖ σ_t ‖ E_t] ∈ ℝ^{192}
+
+  Step 4: Temporal pooling
+    y_f_input = [mean_T(f) ‖ std_T(f)] ∈ ℝ^{384}
+
+  Step 5: MLP
+    y_f = MLP(y_f_input) ∈ ℝ^{256}
+
+────────────────────────────────────────
+5.6 FUSION
+────────────────────────────────────────
+
+  Individual head predictions:
+    ĝ_s = W_s · LayerNorm(y_s) + b_s ∈ ℝ^{2}
+    ĝ_t = W_t · LayerNorm(y_t) + b_t ∈ ℝ^{2}
+    ĝ_f = W_f · LayerNorm(y_f) + b_f ∈ ℝ^{2}
+
+  Aggregate head:
+    ĝ_a = W_a · LayerNorm([y_s ‖ y_t ‖ y_f]) + b_a ∈ ℝ^{2}
+
+  Final logits (log-average ensemble):
+    ĝ = log( (σ(ĝ_s) + σ(ĝ_t) + σ(ĝ_f) + σ(ĝ_a)) / 4 + ε )
+    where σ = softmax, ε = 1e-4
+
+────────────────────────────────────────
+5.7 LOSS FUNCTION
+────────────────────────────────────────
+
+TOTAL LOSS = L_cls + λ_fcg · L_fcg
+
+(a) Classification Loss — Focal Loss (per head at training)
+  
+  L_cls = (1/N) Σ_i Σ_{h ∈ {s,t,f,a}} FL(ĝ_h^i, y^i)
+
+  Focal Loss (γ=4):
+    FL(p, y) = -α_y · (1 - p_y)^γ · log(p_y)
+    where p = softmax(logits), α_y = label_weights[y]
+    γ = 4 (from DFD-FCG — higher than standard γ=2 for harder mining)
+
+  At training, loss is computed on ALL 4 heads concatenated:
+    logits_all = cat([ĝ_s, ĝ_t, ĝ_f, ĝ_a], dim=0)  → [4B, 2]
+    labels_all = repeat(y, 4)                          → [4B]
+    L_cls = mean(FL(logits_all, labels_all)) * cls_weight
+    cls_weight = 10.0
+
+(b) FCG Guidance Loss — Cross-Entropy Alignment
+
+  For each layer l, the synoptic query s_q_l should match its target
+  face part feature f_l:
+
+    s_q_l ∈ ℝ^{B×K×D}   (learned synoptic queries after layer l)
+    f_l ∈ ℝ^{1×K×D}      (pre-extracted face features for layer l)
+
+    Normalize both: ŝ = s / ‖s‖, f̂ = f / ‖f‖
+    similarity = τ · (ŝ @ f̂^T) ∈ ℝ^{B×K×K}     (τ=30)
+
+    L_fcg = (1/LB) Σ_l Σ_b CE(similarity[l,b], target=[0,1,2,3])
+
+  This enforces that synoptic query 0 → lips, 1 → skin, etc.
+  ffg_weight (λ_fcg) = 1.5
+
+WHY THESE LOSS CHOICES:
+  - Focal Loss: Addresses easy/hard example imbalance. γ=4 aggressively
+    down-weights easy examples, focusing on ambiguous boundary cases.
+  - FCG Loss: Acts as structural regularization — prevents synoptic
+    queries from collapsing to same representation. Improves spatial
+    interpretability and generalization to unseen forgery methods.
+
+
+================================================================================
+6. TRAINING PIPELINE
+================================================================================
+
+────────────────────────────────────────
+6.1 HARDWARE ASSUMPTIONS
+────────────────────────────────────────
+
+MINIMUM:
+  - GPU: 1× NVIDIA RTX 3060 (12GB VRAM) or RTX 4060 (8GB)
+  - RAM: 32GB system memory
+  - Storage: 100GB free (datasets + checkpoints)
+  - Training time: ~12-18 hours for 30 epochs
+
+RECOMMENDED:
+  - GPU: 1× NVIDIA RTX 3070/3080 (8-10GB) or RTX 4070 (12GB)
+  - RAM: 64GB
+  - Training time: ~8-12 hours
+
+VRAM BUDGET at batch_size=6, T=8, fp16:
+  ┌─────────────────────────┬──────────┐
+  │ Component               │ VRAM     │
+  ├─────────────────────────┼──────────┤
+  │ Frozen ViT-L/14 weights │ ~1.2GB   │
+  │ ViT forward activations │ ~3.0GB   │
+  │ Synoptic Decoder        │ ~1.5GB   │
+  │ Bi-LSTM                 │ ~0.5GB   │
+  │ DCT Branch              │ ~0.3GB   │
+  │ Gradients + optimizer   │ ~1.5GB   │
+  ├─────────────────────────┼──────────┤
+  │ TOTAL                   │ ~8.0GB   │
+  └─────────────────────────┴──────────┘
+
+────────────────────────────────────────
+6.2 HYPERPARAMETERS
+────────────────────────────────────────
+
+  ┌──────────────────────────┬─────────────────────────────────────────┐
+  │ Parameter                │ Value                                   │
+  ├──────────────────────────┼─────────────────────────────────────────┤
+  │ Batch size               │ 6 (effective, per GPU)                  │
+  │ Accumulate grad batches  │ 2 (effective batch = 12)                │
+  │ Optimizer                │ AdamW                                   │
+  │ Learning rate            │ 1e-4                                    │
+  │ Weight decay             │ 1e-3                                    │
+  │ Betas                    │ (0.9, 0.999)                            │
+  │ LR Scheduler             │ LinearLR (no warmup needed, constant)  │
+  │ Max epochs               │ 30                                      │
+  │ Precision                │ fp16 (mixed precision)                  │
+  │ Gradient clip            │ 0.1 (norm-based)                        │
+  │ Early stopping           │ patience=10, monitor=valid/FFPP/auc     │
+  │ Checkpoint               │ save_top_k=1 on valid/FFPP/auc (max)   │
+  │ Seed                     │ 1019                                    │
+  │ num_frames               │ 8                                       │
+  │ clip_duration            │ 3 seconds                               │
+  │ max_clips                │ 2                                       │
+  │ num_workers              │ 4                                       │
+  │ Focal loss gamma         │ 4                                       │
+  │ cls_weight               │ 10.0                                    │
+  │ ffg_weight               │ 1.5                                     │
+  │ ffg_temper               │ 30                                      │
+  │ label_weights            │ [1.0, 1.0]                              │
+  └──────────────────────────┴─────────────────────────────────────────┘
+
+────────────────────────────────────────
+6.3 TRAINING LOOP PSEUDOCODE
+────────────────────────────────────────
+
+```python
+# ======================= INITIALIZATION =======================
+seed_everything(1019)
+
+# Load frozen backbone
+encoder = load_openclip_vit_l14("ViT-L/14|laion2b_s32b_b82k")
+encoder.requires_grad_(False)
+encoder.eval()
+
+# Build trainable components
+spatial_decoder = SynoDecoder(encoder, num_synos=4, num_frames=8, ksize_s=5)
+temporal_lstm = TemporalBiLSTM(input_dim=1024, hidden_dim=256, num_layers=2)
+frequency_branch = FrequencyDCTBranch(input_size=224, patch_size=8)
+classifier = MultibranchClassifier(
+    spatial_dim=1024, temporal_dim=512, freq_dim=256
+)
+
+# Initialize synoptic embeddings from pre-extracted face features
+face_features = load_pickle("misc/L14_real_semantic_patches_v4_2000.pickle")
+for i, block in enumerate(spatial_decoder.decoder_layers):
+    block.synoptic_embedding.data = face_features['k'][i].clone()
+
+# Optimizer — only trainable params
+trainable_params = (
+    list(spatial_decoder.parameters()) +
+    list(temporal_lstm.parameters()) +
+    list(frequency_branch.parameters()) +
+    list(classifier.parameters())
+)
+optimizer = AdamW(trainable_params, lr=1e-4, weight_decay=1e-3)
+scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=1.0)
+
+# Dataset
+train_dataset = FFPPDataset(
+    split='train', strategy=FORCE_PAIR,
+    augmentations=[NORMAL, VIDEO, VIDEO_RRC, FRAME],
+    df_types=['REAL','DF','FS','F2F','NT'],
+    compressions=['c23'], num_frames=8, clip_duration=3, max_clips=2
+)
+val_dataset = FFPPDataset(
+    split='val', strategy=NORMAL,
+    augmentations=[NONE],
+    df_types=['REAL','DF','FS','F2F','NT'],
+    compressions=['c23'], num_frames=8, clip_duration=3, max_clips=1
+)
+
+scaler = torch.cuda.amp.GradScaler()  # for fp16
+
+# ======================= TRAINING LOOP =======================
+best_auc = 0.0
+patience_counter = 0
+
+for epoch in range(30):
+    # --- TRAIN ---
+    spatial_decoder.train()
+    temporal_lstm.train()
+    frequency_branch.train()
+    classifier.train()
+    encoder.eval()  # ALWAYS frozen
+
+    for batch_idx, batch in enumerate(train_loader):
+        x_raw, y, masks = batch['xyz']           # x_raw: [B,T,3,224,224]
+        x = clip_transform(x_raw)                 # normalized for ViT
+
+        with torch.cuda.amp.autocast():
+            # 1. Frozen encoder pass
+            with torch.no_grad():
+                encoder_output = encoder(x)        # per-layer q,k,v,emb
+                layer_attrs = encoder_output['layer_attrs']  # list of 24 dicts
+
+            # 2. Spatial branch (FCG)
+            y_s = spatial_decoder(x, layer_attrs)  # [B, 1024]
+            synoptic_queries = spatial_decoder.get_synoptic_queries()
+
+            # 3. Temporal branch (Bi-LSTM)
+            cls_tokens = [la['emb'][:,:,0,:] for la in layer_attrs[-4:]]
+            cls_mean = torch.stack(cls_tokens).mean(0)          # [B,T,1024]
+            y_t = temporal_lstm(cls_mean)                        # [B, 512]
+
+            # 4. Frequency branch (DCT)
+            y_f = frequency_branch(x_raw)                        # [B, 256]
+
+            # 5. Classification
+            logits_s, logits_t, logits_f, logits_a = classifier(y_s, y_t, y_f)
+
+            # 6. Loss computation
+            # 6a. Focal classification loss (all heads)
+            all_logits = torch.cat([logits_s, logits_t, logits_f, logits_a])
+            all_labels = y.repeat(4)
+            cls_loss = focal_loss(all_logits, all_labels, gamma=4,
+                                  weight=[1.0, 1.0]).mean() * 10.0
+
+            # 6b. FCG guidance loss
+            fcg_loss = compute_fcg_loss(
+                synoptic_queries, face_features,
+                temperature=30, num_parts=4
+            )
+            total_loss = cls_loss + 1.5 * fcg_loss
+
+        # 7. Backward + optimize
+        scaler.scale(total_loss / accumulate_steps).backward()
+        if (batch_idx + 1) % accumulate_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 0.1)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        # 8. Logging
+        if batch_idx % 10 == 0:
+            wandb.log({
+                'train/loss': total_loss.item(),
+                'train/cls_loss': cls_loss.item(),
+                'train/fcg_loss': fcg_loss.item(),
+            })
+
+    scheduler.step()
+
+    # --- VALIDATION ---
+    val_auc = validate(model, val_loader)   # computes AUC on val set
+    wandb.log({'valid/FFPP/auc': val_auc, 'epoch': epoch})
+
+    # Early stopping & checkpointing
+    if val_auc > best_auc:
+        best_auc = val_auc
+        patience_counter = 0
+        save_checkpoint(model, f'best_model.ckpt')
+    else:
+        patience_counter += 1
+        if patience_counter >= 10:
+            print(f"Early stopping at epoch {epoch}")
+            break
+```
+
+────────────────────────────────────────
+6.4 KEY IMPLEMENTATION NOTES
+────────────────────────────────────────
+
+1. FORCE_PAIR SAMPLING: Each __getitem__ returns (real_clip, fake_clip)
+   from same identity. Collate function flattens to single batch with
+   interleaved labels [0,1,0,1,...].
+
+2. RAW FRAMES FOR DCT: The frequency branch needs un-normalized frames.
+   Store x_raw BEFORE applying CLIP normalization. Pass both x (normalized)
+   and x_raw to the model.
+
+3. GRADIENT FLOW: Encoder is frozen, so no gradients flow through ViT.
+   Only spatial_decoder, temporal_lstm, frequency_branch, classifier
+   receive gradients. This is enforced by torch.no_grad() context.
+
+4. MEMORY OPTIMIZATION: With fp16 and batch=6, fits in 8GB VRAM.
+   If OOM, reduce batch to 4 or num_frames to 6.
+
+5. WANDB LOGGING: Use WandbLogger from pytorch_lightning for
+   experiment tracking. Log loss, AUC, accuracy per epoch.
+
+
+================================================================================
+7. EVALUATION PLAN
+================================================================================
+
+────────────────────────────────────────
+7.1 METRICS
+────────────────────────────────────────
+
+  ┌──────────┬──────────────────────────────────────────────────────────┐
+  │ Metric   │ Description                                             │
+  ├──────────┼──────────────────────────────────────────────────────────┤
+  │ AUC      │ Area Under ROC Curve — primary metric, threshold-free   │
+  │ AP       │ Average Precision — useful for imbalanced test sets     │
+  │ Accuracy │ At threshold=0.5 on P(fake) — secondary metric         │
+  │ F1       │ Harmonic mean of precision & recall at best threshold   │
+  │ EER      │ Equal Error Rate — where FPR = FNR                     │
+  └──────────┴──────────────────────────────────────────────────────────┘
+
+Video-level scoring:
+  - For each video, average clip-level P(fake) across all clips
+  - Use averaged probability for final video-level prediction
+  - This matches the DFD-FCG evaluation protocol
+
+────────────────────────────────────────
+7.2 EVALUATION PROTOCOL
+────────────────────────────────────────
+
+1. IN-DOMAIN TEST (FF++ c23 test split):
+   - Load best checkpoint (by val AUC)
+   - Run on FF++ test.json videos
+   - Report AUC per forgery type + overall
+
+2. CROSS-DATASET GENERALIZATION (Celeb-DF v2):
+   - Same checkpoint (NO fine-tuning on CDF)
+   - Run on all CDF test videos
+   - Report AUC — this is the key generalization metric
+
+3. PER-FORGERY-TYPE BREAKDOWN:
+   ┌─────────┬─────────────────────────────────────────┐
+   │ Type    │ What it Tests                           │
+   ├─────────┼─────────────────────────────────────────┤
+   │ DF      │ Classic DeepFakes (face swap)           │
+   │ F2F     │ Face2Face (expression transfer)         │
+   │ FS      │ FaceSwap (3DMM-based)                   │
+   │ NT      │ NeuralTextures (rendering-based)        │
+   │ CDF     │ Celeb-DF (improved deepfake quality)    │
+   └─────────┴─────────────────────────────────────────┘
+
+4. EXPECTED PERFORMANCE TARGETS:
+   ┌──────────┬──────────────┐
+   │ Test Set │ Target AUC   │
+   ├──────────┼──────────────┤
+   │ FF++ c23 │ > 0.98       │
+   │ CDF      │ > 0.85       │
+   └──────────┴──────────────┘
+
+────────────────────────────────────────
+7.3 ROBUSTNESS TESTING (Optional)
+────────────────────────────────────────
+
+If resources allow, test on perturbed FF++ test set:
+  - Gaussian Noise (levels 1-5)
+  - Gaussian Blur (levels 1-5)
+  - JPEG Compression (QF: 10,20,30,40,50)
+  - Brightness/contrast changes
+  - Resolution downscaling
+
+Use scripts/tools/create-robust-config.sh to generate configs.
+
+
+================================================================================
+8. EXPLAINABILITY MODULE
+================================================================================
+
+────────────────────────────────────────
+8.1 SPATIAL ATTENTION MAPS (from FCG)
+────────────────────────────────────────
+
+SOURCE: The synoptic attention weights α_l from each SynoBlock.
+
+For each frame t and face part k:
+  attention_map[k] = Σ_l α_l[:, t, k, :].reshape(16, 16)
+  This gives a 16×16 heatmap showing which patches the model
+  associates with each face part (lips, skin, eyes, nose).
+
+VISUALIZATION:
+  1. Reshape α to 16×16 grid
+  2. Upscale to 224×224 using bilinear interpolation
+  3. Apply colormap (jet or inferno)
+  4. Overlay on original face crop with alpha=0.5
+
+Output format (for UI):
+  {
+    "frame_idx": int,
+    "attention_maps": {
+      "lips": np.ndarray [224,224],    # heatmap values 0-1
+      "skin": np.ndarray [224,224],
+      "eyes": np.ndarray [224,224],
+      "nose": np.ndarray [224,224]
+    },
+    "combined_map": np.ndarray [224,224]  # max across parts
+  }
+
+────────────────────────────────────────
+8.2 FRAME-LEVEL FAKE PROBABILITY
+────────────────────────────────────────
+
+For frame-level analysis, run inference per-frame (T=1 clips):
+  - Slide a window of T=8 frames across the video
+  - At each position, get P(fake) from the combined logits
+  - Plot P(fake) vs frame_number as a time-series
+
+Output format:
+  {
+    "frame_probabilities": List[float],  # P(fake) per frame
+    "fps": float,                        # video FPS
+    "threshold": float,                  # 0.5 default
+    "overall_prediction": str,           # "REAL" or "FAKE"
+    "overall_confidence": float          # max P(fake) or avg
+  }
+
+────────────────────────────────────────
+8.3 TEMPORAL ANOMALY DETECTION
+────────────────────────────────────────
+
+From the Bi-LSTM attention weights w_t:
+  - Plot attention weights over time: which frames get most weight
+  - High-attention frames are "most suspicious" temporally
+  - Combine with frame-level P(fake) for comprehensive analysis
+
+────────────────────────────────────────
+8.4 FREQUENCY SPECTRUM VISUALIZATION
+────────────────────────────────────────
+
+From the DCT branch:
+  - Show average DCT spectrum (8×8 heatmap) for real vs predicted-fake
+  - Highlight frequency bands where real and fake differ most
+  - This helps explain WHY the frequency branch flagged a video
+
+Output format:
+  {
+    "dct_spectrum": np.ndarray [8,8],     # average DCT coefficients
+    "anomaly_bands": List[Tuple[int,int]] # suspicious freq bands
+  }
+
+
+================================================================================
+9. UI DESIGN (Gradio)
+================================================================================
+
+────────────────────────────────────────
+9.1 INTERFACE LAYOUT
+────────────────────────────────────────
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  🔍 DEEPFAKE DETECTION SYSTEM                                       │
+│  ─────────────────────────────────────────────────────────────       │
+│                                                                      │
+│  ┌─────────────────────┐  ┌──────────────────────────────────┐      │
+│  │                     │  │  PREDICTION                       │      │
+│  │  📹 Upload Video    │  │                                   │      │
+│  │                     │  │  Result: FAKE ⚠️ (92.3%)         │      │
+│  │  [Drop file here]   │  │                                   │      │
+│  │                     │  │  Spatial Score:  0.89              │      │
+│  │  Supported:         │  │  Temporal Score: 0.94              │      │
+│  │  .mp4 .avi .mov     │  │  Frequency Score: 0.87             │      │
+│  │                     │  │  Combined Score: 0.923             │      │
+│  └─────────────────────┘  └──────────────────────────────────┘      │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  📊 FRAME-LEVEL ANALYSIS                                    │    │
+│  │  [Line chart: P(fake) vs frame number]                      │    │
+│  │  Threshold line at 0.5                                      │    │
+│  │  Red zone: frames above threshold                           │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────┐  ┌────────────────────────────────────┐    │
+│  │  🔥 HEATMAPS       │  │  📈 FREQUENCY ANALYSIS             │    │
+│  │                    │  │                                     │    │
+│  │  [Face + overlay]  │  │  [8×8 DCT spectrum heatmap]        │    │
+│  │                    │  │                                     │    │
+│  │  Part: [dropdown]  │  │  [Real vs Fake comparison]         │    │
+│  │  ☑ lips ☑ eyes   │  │                                     │    │
+│  │  ☑ skin ☑ nose   │  │                                     │    │
+│  │                    │  │                                     │    │
+│  │  Frame: [slider]   │  │                                     │    │
+│  └────────────────────┘  └────────────────────────────────────┘    │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  🎥 ANNOTATED VIDEO OUTPUT                                  │    │
+│  │  [Video player with bbox + REAL/FAKE overlay per frame]     │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+
+────────────────────────────────────────
+9.2 GRADIO IMPLEMENTATION
+────────────────────────────────────────
+
+```python
+import gradio as gr
+
+def predict_video(video_path, threshold=0.5):
+    """Main prediction function."""
+    # 1. Preprocess: face detection + cropping
+    preprocessed = preprocess_video(video_path)
+    
+    # 2. Run inference
+    results = model.inference(preprocessed)
+    
+    # 3. Generate outputs
+    prediction = "FAKE" if results['overall_prob'] > threshold else "REAL"
+    confidence = results['overall_prob']
+    
+    # 4. Generate frame-level plot
+    frame_plot = plot_frame_probabilities(
+        results['frame_probs'], threshold, results['fps']
+    )
+    
+    # 5. Generate heatmaps
+    heatmap_images = generate_attention_overlays(
+        preprocessed['frames'], results['attention_maps']
+    )
+    
+    # 6. Generate frequency analysis
+    freq_plot = plot_dct_analysis(results['dct_spectrum'])
+    
+    # 7. Generate annotated video
+    annotated_video = create_annotated_video(
+        video_path, results['frame_probs'],
+        results['bboxes'], threshold
+    )
+    
+    return (
+        f"{prediction} ({confidence:.1%})",
+        f"Spatial: {results['spatial_score']:.3f}",
+        f"Temporal: {results['temporal_score']:.3f}",
+        f"Frequency: {results['freq_score']:.3f}",
+        frame_plot,
+        heatmap_images,
+        freq_plot,
+        annotated_video
+    )
+
+# Build Gradio interface
+with gr.Blocks(title="DeepFake Detector", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🔍 Multimodal DeepFake Detection System")
+    gr.Markdown("Upload a video to analyze for deepfake manipulation.")
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            video_input = gr.Video(label="Upload Video")
+            threshold_slider = gr.Slider(0.1, 0.9, 0.5, label="Threshold")
+            analyze_btn = gr.Button("🔍 Analyze", variant="primary")
+        
+        with gr.Column(scale=1):
+            result_text = gr.Textbox(label="Prediction")
+            spatial_text = gr.Textbox(label="Spatial Score")
+            temporal_text = gr.Textbox(label="Temporal Score")
+            freq_text = gr.Textbox(label="Frequency Score")
+    
+    with gr.Row():
+        frame_plot = gr.Plot(label="Frame-Level Analysis")
+    
+    with gr.Row():
+        with gr.Column():
+            heatmap_gallery = gr.Gallery(label="Attention Heatmaps")
+            frame_slider = gr.Slider(0, 100, 0, label="Frame")
+            part_dropdown = gr.Dropdown(
+                ["All", "Lips", "Eyes", "Skin", "Nose"],
+                value="All", label="Face Part"
+            )
+        with gr.Column():
+            freq_plot_output = gr.Plot(label="Frequency Analysis")
+    
+    with gr.Row():
+        output_video = gr.Video(label="Annotated Video")
+    
+    analyze_btn.click(
+        predict_video,
+        inputs=[video_input, threshold_slider],
+        outputs=[
+            result_text, spatial_text, temporal_text, freq_text,
+            frame_plot, heatmap_gallery, freq_plot_output, output_video
+        ]
+    )
+
+demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+```
+
+────────────────────────────────────────
+9.3 BACKEND API STRUCTURE
+────────────────────────────────────────
+
+The Gradio app internally calls these functions:
+
+  preprocess_video(video_path) → dict:
+    Steps: extract frames → face detect → crop → align
+    Returns: {frames, bboxes, landmarks, fps, cropped_frames}
+
+  model.inference(preprocessed) → dict:
+    Steps: transform → encode → spatial/temporal/freq → classify
+    Returns: {
+      overall_prob, frame_probs, spatial_score, temporal_score,
+      freq_score, attention_maps, dct_spectrum, per_frame_logits
+    }
+
+  generate_attention_overlays(frames, attention_maps) → List[Image]:
+    Steps: reshape 16×16 → upsample 224×224 → colormap → overlay
+    Returns: list of PIL Images with heatmap overlays
+
+  create_annotated_video(video_path, probs, bboxes, threshold) → str:
+    Steps: draw bbox per frame → write output video
+    Returns: path to annotated video file
+
+
+================================================================================
+10. FULL PROJECT STRUCTURE
+================================================================================
+
+Multimodal-Deepfake/
+├── main.py                        # Training entry point (Lightning CLI)
+├── inference.py                   # Multi-GPU inference with DDP
+├── demo.py                        # Single-video inference script
+├── app.py                         # Gradio UI (Section 9)
+├── environment.yml                # Conda environment spec
+├── plan.txt                       # THIS DOCUMENT
+├── readme.md                      # Project documentation
+│
+├── configs/                       # YAML configurations
+│   ├── base.yaml                  # Optimizer, scheduler, trainer defaults
+│   ├── data.yaml                  # Dataset module configuration
+│   └── clip/
+│       └── L14/
+│           ├── ffg_bilstm_dct.yaml  # [NEW] Our model config
+│           ├── ffg.yaml             # Original DFD-FCG (baseline)
+│           ├── svl.yaml             # SVL baseline
+│           └── evl.yaml             # EVL baseline
+│
+├── misc/
+│   ├── 20words_mean_face.npy      # Mean face for alignment
+│   └── L14_real_semantic_patches_v4_2000.pickle  # FCG face features
+│
+├── src/
+│   ├── clip/                      # CLIP backbone (FROZEN)
+│   │   ├── clip.py                # Model loading + tokenization
+│   │   └── model_syno.py          # Modified ViT with attr extraction
+│   │
+│   ├── model/                     # Trainable models
+│   │   ├── base.py                # ODBinaryMetricClassifier base class
+│   │   └── clip/
+│   │       ├── __init__.py        # OpenCLIP loader + model interface
+│   │       ├── svl.py             # SynoVideoLearner + FFGSynoVideoLearner
+│   │       ├── evl.py             # EfficientVideoLearner baseline
+│   │       ├── temporal_lstm.py   # [NEW] TemporalBiLSTM module
+│   │       ├── frequency_dct.py   # [NEW] FrequencyDCTBranch module
+│   │       └── enhanced_model.py  # [NEW] EnhancedFFGVideoLearner
+│   │                              #       (combines spatial+LSTM+DCT)
+│   │
+│   ├── dataset/                   # Data loading
+│   │   ├── base.py                # DeepFakeDataset + DeepFakeDataModule
+│   │   └── ffpp.py                # FF++ specific loading + sampling
+│   │
+│   ├── preprocess/                # Preprocessing scripts
+│   │   ├── fetch_landmark_bbox.py # Facial landmark extraction
+│   │   └── crop_main_face.py      # Face cropping + alignment
+│   │
+│   └── utility/
+│       ├── loss.py                # Focal loss implementation
+│       └── builtin.py             # ODLightningCLI, ODTrainer, etc.
+│
+├── scripts/                       # Shell scripts for training/eval
+│   ├── train_enhanced.sh          # [NEW] Train enhanced model
+│   ├── eval_enhanced.sh           # [NEW] Cross-dataset evaluation
+│   └── tools/
+│       └── create-robust-config.sh
+│
+└── datasets/                      # Data directory (symlinks ok)
+    ├── ffpp/                      # FaceForensics++
+    └── cdf/                       # Celeb-DF v2
+
+
+────────────────────────────────────────
+10.1 NEW FILES TO CREATE
+────────────────────────────────────────
+
+FILE 1: src/model/clip/temporal_lstm.py
+  Contains: TemporalBiLSTM class
+  ~100 lines
+  See Section 4.3 for architecture details
+
+FILE 2: src/model/clip/frequency_dct.py
+  Contains: FrequencyDCTBranch class + dct_matrix_2d() helper
+  ~120 lines
+  See Section 4.4 for architecture details
+
+FILE 3: src/model/clip/enhanced_model.py
+  Contains: EnhancedFFGVideoLearner (extends FFGSynoVideoLearner)
+  ~250 lines
+  Integrates spatial (inherited) + temporal_lstm + frequency_dct
+  Overrides forward() and compute_loss() to include all 3 branches
+
+FILE 4: configs/clip/L14/ffg_bilstm_dct.yaml
+  New config file for enhanced model
+  ~20 lines
+
+FILE 5: app.py
+  Gradio UI application
+  ~200 lines
+  See Section 9 for implementation details
+
+FILE 6: scripts/train_enhanced.sh
+  Training launch script
+  ~15 lines
+
+────────────────────────────────────────
+10.2 FILES TO MODIFY
+────────────────────────────────────────
+
+MODIFY: src/model/base.py
+  Add: predict_step() method if not present (for inference pipeline)
+  Add: Support for returning per-branch scores
+
+MODIFY: src/dataset/base.py
+  Add: Return raw (un-normalized) frames alongside CLIP-normalized frames
+  The x_raw tensor is needed by the DCT frequency branch
+
+MODIFY: configs/data.yaml
+  Update: num_frames from 10 to 8
+  Update: max_clips from 3 to 2
+
+────────────────────────────────────────
+10.3 NEW CONFIG: ffg_bilstm_dct.yaml
+────────────────────────────────────────
+
+```yaml
+model:
+  class_path: src.model.clip.enhanced_model.EnhancedFFGVideoLearner
+  init_args:
+    num_frames: 8
+    architecture: ViT-L/14
+    ksize_s: 5
+    ksize_t: 5
+    s_k_attr: 'k'
+    s_v_attr: 'emb'
+    t_attrs: ["q","k","v"]
+    face_feature_path: "misc/L14_real_semantic_patches_v4_2000.pickle"
+    face_parts: ["lips","skin","eyes","nose"]
+    # NEW temporal branch config
+    temporal_hidden_dim: 256
+    temporal_num_layers: 2
+    temporal_dropout: 0.3
+    temporal_cls_layers: [21,22,23,24]  # which ViT layers to use
+    # NEW frequency branch config
+    dct_patch_size: 8
+    freq_hidden_dim: 512
+    freq_output_dim: 256
+    freq_dropout: 0.3
+
+trainer:
+  accumulate_grad_batches: 2
+```
+
+
+================================================================================
+11. LIBRARY SPECIFICATIONS
+================================================================================
+
+────────────────────────────────────────
+11.1 CORE DEPENDENCIES
+────────────────────────────────────────
+
+  ┌──────────────────────────┬──────────┬────────────────────────────┐
+  │ Library                  │ Version  │ Purpose                    │
+  ├──────────────────────────┼──────────┼────────────────────────────┤
+  │ python                   │ 3.8+     │ Runtime                    │
+  │ torch                    │ 2.2+     │ Deep learning framework    │
+  │ torchvision              │ 0.17+    │ Vision utilities           │
+  │ lightning                │ 2.2+     │ Training framework         │
+  │ pytorch-lightning        │ 2.2+     │ Lightning CLI              │
+  │ open-clip-torch          │ 2.24+    │ OpenCLIP models            │
+  │ albumentations           │ 1.4+     │ Data augmentation          │
+  │ face-alignment           │ 1.4+     │ Face detection/landmarks   │
+  │ opencv-python            │ 4.9+     │ Video/image processing     │
+  │ torchmetrics             │ 1.3+     │ Metric computation         │
+  │ numpy                    │ 1.24+    │ Numerical computing        │
+  │ scipy                    │ 1.10+    │ DCT utilities              │
+  │ matplotlib               │ 3.7+     │ Visualization              │
+  │ gradio                   │ 4.0+     │ Web UI                     │
+  │ wandb                    │ 0.16+    │ Experiment tracking        │
+  │ av                       │ 11.0+    │ Video I/O                  │
+  │ pillow                   │ 10.2+    │ Image processing           │
+  │ jsonargparse             │ 4.27+    │ Config parsing             │
+  │ omegaconf                │ 2.3+     │ YAML config support        │
+  └──────────────────────────┴──────────┴────────────────────────────┘
+
+────────────────────────────────────────
+11.2 INSTALL COMMANDS
+────────────────────────────────────────
+
+  # Option A: Using conda environment.yml
+  conda env create -f environment.yml
+  conda activate dfd-fcg
+  pip install gradio>=4.0
+
+  # Option B: Fresh install
+  conda create -n deepfake python=3.8
+  conda activate deepfake
+  pip install torch==2.2.1 torchvision==0.17.1 --index-url https://download.pytorch.org/whl/cu121
+  pip install lightning==2.2.0 pytorch-lightning==2.2.0
+  pip install open-clip-torch==2.24.0
+  pip install albumentations==1.4.0 face-alignment==1.4.1
+  pip install opencv-python==4.9.0.80
+  pip install torchmetrics==1.3.1 wandb==0.16.3
+  pip install scipy matplotlib gradio av pillow
+  pip install jsonargparse[omegaconf]==4.27.5
+
+
+================================================================================
+12. NOVEL CONTRIBUTIONS & ABLATION PLAN
+================================================================================
+
+────────────────────────────────────────
+12.1 RESEARCH CONTRIBUTIONS
+────────────────────────────────────────
+
+This system makes 3 novel contributions over the DFD-FCG baseline:
+
+  1. TEMPORAL Bi-LSTM WITH DIFFERENCE FEATURES
+     - Replaces DFD-FCG's Conv2D temporal affinity with a Bi-LSTM
+     - Adds temporal difference features (frame-to-frame deltas)
+     - Uses attention pooling instead of fixed temporal pooling
+     - Captures sequential patterns + sudden transitions
+     
+     Novelty: No prior work combines CLIP's CLS tokens with temporal
+     difference features in a Bi-LSTM for deepfake detection.
+
+  2. FREQUENCY-DOMAIN DCT BRANCH
+     - Adds a parallel frequency analysis pathway using block-DCT
+     - Computes spectral statistics (mean, std, energy per frequency)
+     - Complementary to RGB-domain spatial analysis
+     
+     Novelty: While DCT has been used in image forensics, integrating
+     it as a learnable branch alongside CLIP features with end-to-end
+     training is novel for video deepfake detection.
+
+  3. MULTI-BRANCH LATE FUSION WITH LOG-AVERAGE ENSEMBLE
+     - Combines spatial (FCG), temporal (LSTM), and frequency (DCT)
+     - Uses per-branch classification heads + aggregate head
+     - Log-average ensemble prevents any single branch from dominating
+     
+     Novelty: Three distinct feature domains (spatial RGB, temporal
+     sequence, frequency spectrum) fused with architectural diversity.
+
+────────────────────────────────────────
+12.2 ABLATION STUDY PLAN
+────────────────────────────────────────
+
+Run the following experiments (each trained 30 epochs, same seed):
+
+  ┌────────┬───────────┬──────────┬──────────┬──────────────────────┐
+  │ Exp ID │ Spatial   │ Temporal │ Freq     │ Purpose              │
+  ├────────┼───────────┼──────────┼──────────┼──────────────────────┤
+  │ A1     │ FCG       │ ✗        │ ✗        │ Spatial-only baseline│
+  │ A2     │ ✗         │ Bi-LSTM  │ ✗        │ Temporal-only        │
+  │ A3     │ ✗         │ ✗        │ DCT      │ Frequency-only       │
+  │ A4     │ FCG       │ Bi-LSTM  │ ✗        │ Spatial + Temporal   │
+  │ A5     │ FCG       │ ✗        │ DCT      │ Spatial + Frequency  │
+  │ A6     │ ✗         │ Bi-LSTM  │ DCT      │ Temporal + Frequency │
+  │ A7     │ FCG       │ Bi-LSTM  │ DCT      │ FULL MODEL (ours)    │
+  │ B1     │ FCG       │ DFD-FCG  │ ✗        │ Original DFD-FCG     │
+  └────────┴───────────┴──────────┴──────────┴──────────────────────┘
+
+Expected outcome: A7 > B1 ≈ A4 > A1 > A5 > A6 > A2 > A3
+
+TEMPORAL ABLATION (within A2):
+  ┌────────┬──────────────────────┬──────────────────────────────────┐
+  │ Exp    │ Variant              │ Purpose                          │
+  ├────────┼──────────────────────┼──────────────────────────────────┤
+  │ T1     │ LSTM, no diff        │ Effect of temporal differences   │
+  │ T2     │ LSTM, with diff      │ Full temporal branch             │
+  │ T3     │ GRU, with diff       │ GRU vs LSTM comparison           │
+  │ T4     │ LSTM unidirectional  │ Bidirectional vs unidirectional  │
+  │ T5     │ LSTM 1-layer         │ Depth ablation                   │
+  └────────┴──────────────────────┴──────────────────────────────────┘
+
+────────────────────────────────────────
+12.3 COMPARISON TABLE (Expected Results)
+────────────────────────────────────────
+
+  ┌─────────────────────┬─────────────┬───────────┐
+  │ Method              │ FF++ AUC    │ CDF AUC   │
+  ├─────────────────────┼─────────────┼───────────┤
+  │ DFD-FCG (paper)     │ 0.996       │ 0.884     │
+  │ SVL (baseline)      │ 0.993       │ 0.846     │
+  │ OURS (A7)           │ ~0.996      │ ~0.890    │
+  └─────────────────────┴─────────────┴───────────┘
+
+  The primary goal is to MATCH or EXCEED DFD-FCG on CDF (cross-dataset)
+  while providing better explainability through the 3-branch architecture.
+
+
+================================================================================
+END OF BLUEPRINT
+================================================================================
+
+NEXT STEPS:
+  1. Review this blueprint and approve design decisions
+  2. Implement the 6 new files (Section 10.1)
+  3. Modify 3 existing files (Section 10.2)
+  4. Train the model (Section 6)
+  5. Evaluate (Section 7)
+  6. Build UI (Section 9)
+
+IMPLEMENTATION ORDER (recommended):
+  Phase 1: temporal_lstm.py → frequency_dct.py → enhanced_model.py
+  Phase 2: ffg_bilstm_dct.yaml → data.yaml updates → base.py updates
+  Phase 3: Train + evaluate
+  Phase 4: app.py (Gradio UI)
+

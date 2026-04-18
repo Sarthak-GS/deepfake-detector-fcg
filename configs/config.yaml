@@ -1,0 +1,74 @@
+# config.yaml
+# -----------
+# All hyperparameters for the EnhancedDeepfakeDetector.
+# Pass this to train.py with: python train.py --config configs/config.yaml
+# Any argument in this file overrides the command-line defaults.
+#
+# USAGE:
+#   python train.py \
+#       --ffpp-root datasets/ffpp \
+#       --face-features misc/L14_real_semantic_patches_v4_2000.pickle \
+#       --output-dir checkpoints/run1
+
+# ─────────────────────────────────────────────
+# DATA
+# ─────────────────────────────────────────────
+num_frames: 16         # frames sampled per clip (Optimized for 48GB GPU)
+clip_duration: 3.0     # seconds per clip
+num_workers: 12         # parallel CPU threads for lightning-fast dataloading
+
+# ─────────────────────────────────────────────
+# TRAINING
+# ─────────────────────────────────────────────
+batch_size: 8          # videos per batch (Optimized for 48GB GPU)
+epochs: 30
+lr: 0.0001             # AdamW learning rate (1e-4)
+weight_decay: 0.001    # AdamW weight decay (1e-3)
+accum_steps: 2         # gradient accumulation → effective batch = 8*2 = 16
+patience: 10           # early stopping patience (val AUC)
+seed: 1019
+
+# ─────────────────────────────────────────────
+# LOSS WEIGHTS (plan.txt Section 5.7)
+# ─────────────────────────────────────────────
+cls_weight: 10.0       # scale for focal classification loss
+ffg_weight: 1.5        # scale for FCG alignment loss
+focal_gamma: 4.0       # focal loss gamma (harder mining than standard γ=2)
+ffg_temperature: 30.0  # cosine similarity temperature for FCG loss
+
+# ─────────────────────────────────────────────
+# SPATIAL BRANCH (FCG Synoptic Decoder)
+# plan.txt Section 4.2
+# ─────────────────────────────────────────────
+ksize_s: 5             # spatial kernel size in SynoBlock
+num_synos: 4           # synoptic queries = face parts (lips, skin, eyes, nose)
+
+# ─────────────────────────────────────────────
+# TEMPORAL BRANCH (Bi-LSTM)
+# plan.txt Section 4.3
+# ─────────────────────────────────────────────
+temporal_hidden_dim: 256     # LSTM hidden size per direction → output = 512
+temporal_num_layers: 2       # stacked LSTM layers
+temporal_dropout: 0.3        # dropout between LSTM layers
+temporal_cls_layers:         # which ViT layers to average CLS from
+  - 20
+  - 21
+  - 22
+  - 23
+
+# ─────────────────────────────────────────────
+# FREQUENCY BRANCH (DCT)
+# plan.txt Section 4.4
+# ─────────────────────────────────────────────
+dct_patch_size: 8      # 8×8 blocks (matches JPEG standard)
+freq_hidden_dim: 512   # MLP hidden layer size
+freq_output_dim: 256   # final frequency feature size
+freq_dropout: 0.3      # MLP dropout
+
+# ─────────────────────────────────────────────
+# BACKBONE
+# plan.txt Section 4.1
+# ─────────────────────────────────────────────
+backbone: "ViT-L-14"
+pretrained: "laion2b_s32b_b82k"
+# NOTE: backbone is ALWAYS frozen — these are just identification strings
