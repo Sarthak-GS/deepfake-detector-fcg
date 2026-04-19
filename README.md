@@ -75,7 +75,6 @@ pip install scikit-learn==1.3.2 scipy==1.10.1
 | **DF40** | Fake faces | ~20GB (trimmed) | Training | [GitHub](https://github.com/YZY-stack/DF40) / [Videos](https://drive.google.com/drive/folders/1GB3FN4pjf9Q5hhhcBmBTdMmEmtrDe9zZ) |
 | **FaceForensics++** (c23) | Multi-method manipulation | ~40GB | Training & Testing | [Kaggle](https://www.kaggle.com/datasets/xdxd003/ff-c23) / [Official](https://github.com/ondyari/FaceForensics) |
 | **FaceShifter** | Face-swap detection | ~5GB | Cross-validation | Part of FF++ |
-| **Celeb-DF v2** | High-quality synthetic videos | ~15GB | Cross-dataset evaluation | [Download](http://www.cs.albany.edu/~lsw/celeb-df.html) |
 
 ### **FaceForensics++ (FF++) Folder Structure**
 
