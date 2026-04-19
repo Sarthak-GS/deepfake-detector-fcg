@@ -269,7 +269,7 @@ We provide a pre-trained model checkpoint trained on DF40 + FaceForensics++ + Fa
 
 #### **Step 1: Download the Checkpoint**
 
-1. Click the [Google Drive link](https://drive.google.com/drive/your-checkpoint-link)
+1. Click the [Google Drive link](https://drive.google.com/drive/folders/1rKCkIgExfYjbyKsz3LCHr4wIlpzJt7BR)
 2. Download the file: `best.pt`
 
 #### **Step 2: Place in Correct Directory**
@@ -725,9 +725,6 @@ python test.py \
 ### **Setup Instructions**
 
 #### **Step 1: Download the Checkpoint**
-
-1. Click the [Google Drive link](https://drive.google.com/drive/your-checkpoint-link)
-2. Download the file: `best.pt`
 
 #### **Step 2: Place in Correct Directory**
 
